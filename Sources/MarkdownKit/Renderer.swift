@@ -94,11 +94,31 @@ public enum Renderer {
         let mdJSON = jsonString(markdown)
         let baseHref = baseDirectory.absoluteString  // file:///.../ with trailing slash
 
+        // Per-render nonce. Only our own (trusted) script tags carry it, so the
+        // CSP `script-src 'nonce-...'` lets them run while blocking any <script>
+        // an untrusted markdown file injects via html:true.
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        // Content Security Policy hardening for untrusted markdown:
+        //   - script-src 'nonce-...'  -> attacker-injected inline scripts cannot run
+        //   - connect-src 'none'      -> no fetch/XHR, so even if script ran it
+        //                                could not read+exfiltrate local files
+        //   - default-src 'none'      -> deny everything not explicitly allowed
+        // style 'unsafe-inline' is required (inlined CSS + Mermaid-injected styles);
+        // img allows remote URLs so normal markdown images render.
+        let csp = "default-src 'none'; "
+            + "img-src file: data: https: http:; "
+            + "style-src 'unsafe-inline'; "
+            + "script-src 'nonce-\(nonce)'; "
+            + "font-src file: data: https:; "
+            + "connect-src 'none'"
+
         return """
         <!DOCTYPE html>
         <html lang="en">
         <head>
         <meta charset="utf-8">
+        <meta http-equiv="Content-Security-Policy" content="\(escapeAttr(csp))">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <base href="\(escapeAttr(baseHref))">
         <style>
@@ -142,12 +162,12 @@ public enum Renderer {
         <body>
         <article id="content" class="markdown-body"></article>
 
-        <script>\(vendor["markdown-it.min.js"] ?? "")</script>
-        <script>\(vendor["markdown-it-task-lists.min.js"] ?? "")</script>
-        <script>\(vendor["highlight.min.js"] ?? "")</script>
-        <script>\(vendor["mermaid.min.js"] ?? "")</script>
+        <script nonce="\(nonce)">\(vendor["markdown-it.min.js"] ?? "")</script>
+        <script nonce="\(nonce)">\(vendor["markdown-it-task-lists.min.js"] ?? "")</script>
+        <script nonce="\(nonce)">\(vendor["highlight.min.js"] ?? "")</script>
+        <script nonce="\(nonce)">\(vendor["mermaid.min.js"] ?? "")</script>
 
-        <script>
+        <script nonce="\(nonce)">
         (function () {
             "use strict";
             var MD_SOURCE = \(mdJSON);
@@ -200,7 +220,7 @@ public enum Renderer {
             if (window.mermaid) {
                 window.mermaid.initialize({
                     startOnLoad: false,
-                    securityLevel: "loose",
+                    securityLevel: "strict",  // sanitize labels, disable click callbacks
                     theme: dark ? "dark" : "default"
                 });
                 var nodes = document.querySelectorAll("pre.mermaid");
@@ -223,13 +243,23 @@ public enum Renderer {
 
     // MARK: - Escaping helpers
 
-    /// JSON-encode a string into a JS string literal (safe for embedding).
+    /// JSON-encode a string into a JS string literal safe to embed inside a
+    /// `<script>` element. JSONEncoder does not escape `<`, so markdown
+    /// containing `</script>` would otherwise terminate our script tag early
+    /// (breaking rendering and enabling markup injection). Escaping `<`, `>` and
+    /// `&` as \uXXXX neutralizes that, and U+2028/U+2029 keeps the literal valid
+    /// JS (they are line terminators in older parsers).
     private static func jsonString(_ s: String) -> String {
-        if let data = try? JSONEncoder().encode(s),
-           let str = String(data: data, encoding: .utf8) {
-            return str
+        guard let data = try? JSONEncoder().encode(s),
+              let str = String(data: data, encoding: .utf8) else {
+            return "\"\""
         }
-        return "\"\""
+        return str
+            .replacingOccurrences(of: "<", with: "\\u003c")
+            .replacingOccurrences(of: ">", with: "\\u003e")
+            .replacingOccurrences(of: "&", with: "\\u0026")
+            .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+            .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
     }
 
     private static func escapeAttr(_ s: String) -> String {

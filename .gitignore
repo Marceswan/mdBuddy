@@ -3,3 +3,4 @@ mdBuddy.app/
 .DS_Store
 *.xcodeproj
 .playwright-mcp/
+.mdBuddy-preview.html

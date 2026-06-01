@@ -143,3 +143,41 @@ and think the fix failed.
 `Sources/MarkdownQuickLook/Info.plist` (QLSupportedContentTypes),
 `Sources/MarkdownKit/Renderer.swift` (`html(forFileAt:content:)`,
 `htmlForMermaidDiagram`).
+
+## 2026-06-01 — untrusted-markdown-xss-hardening (do not regress)
+
+**Symptom:** Security review flagged the renderer: `html: true` markdown-it with
+no sanitizer, Mermaid `securityLevel: "loose"`, and (newly introduced)
+`loadFileURL(..., allowingReadAccessTo: URL(fileURLWithPath: "/"))`. Opening a
+hostile `.md` could run injected JS and read/exfiltrate arbitrary local files.
+Also discovered: a `.md` containing `</script>` broke rendering outright,
+because the markdown is embedded into a `<script>` block and `JSONEncoder` does
+NOT escape `<` -> the HTML parser closed our script tag early (script-context
+breakout = the XSS mechanism).
+
+**Root cause:** WKWebView renders attacker-controlled HTML/JS with broad file
+access and no CSP. `JSONEncoder` output is not safe to drop inside `<script>`.
+
+**Fix / prevention (all four layers are load-bearing -- keep them):**
+1. `Renderer.jsonString` escapes `<` `>` `&` (and U+2028/U+2029) as `\uXXXX`
+   so embedded markdown can never break out of the `<script>` tag.
+2. CSP `<meta>` per render: `script-src 'nonce-<uuid>'` (our 5 script tags carry
+   the nonce; attacker `<script>` does not -> blocked) + `connect-src 'none'`
+   (no fetch/XHR -> no file exfiltration even if script ran) + `default-src
+   'none'`. `style-src 'unsafe-inline'` is REQUIRED (inlined CSS + Mermaid styles).
+3. Mermaid `securityLevel: "strict"` (was "loose").
+4. App grants `allowingReadAccessTo: baseDir` (NOT `/`) by writing
+   `.mdBuddy-preview.html` INTO the markdown's folder, scoping file reach to the
+   opened directory. (Quick Look already uses `baseURL: nil`, fully inlined.)
+
+Verified in real WebKit: markdown + Mermaid render (svg present), and an
+injected `</script>`/`<script>`/`onerror` probe does NOT execute.
+
+**Avoid:** Do NOT revert step 4 to `allowingReadAccessTo: "/"` -- that was the
+CRITICAL finding. Do NOT set Mermaid back to "loose". Do NOT add `'unsafe-eval'`
+or `'unsafe-inline'` to `script-src` (defeats the nonce). Mermaid 11.4.1 renders
+fine under strict CSP with no `eval` -- confirmed.
+
+**References:** `Sources/MarkdownKit/Renderer.swift` (CSP/nonce/jsonString/
+securityLevel), `Sources/mdBuddy/MarkdownWebView.swift` (`render`,
+`removeRenderFile`).

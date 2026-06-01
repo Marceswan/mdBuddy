@@ -49,12 +49,9 @@ struct MarkdownWebView: NSViewRepresentable {
         var loadedVersion: Int = -1
         var pendingScrollY: CGFloat?
 
-        private let tempHTMLURL: URL = {
-            let dir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("mdBuddy", isDirectory: true)
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            return dir.appendingPathComponent("render.html")
-        }()
+        /// The last on-disk render file we wrote, so we can remove it when the
+        /// open file changes or the view goes away.
+        private var lastRenderURL: URL?
 
         func render(model: DocumentModel, webView: WKWebView) {
             guard let url = model.currentURL,
@@ -62,22 +59,35 @@ struct MarkdownWebView: NSViewRepresentable {
             let baseDir = url.deletingLastPathComponent()
             // Renders Markdown, or a raw Mermaid diagram for .mmd/.mermaid files.
             let html = Renderer.html(forFileAt: url, content: markdown)
+
+            // Write the rendered HTML INTO the markdown's own folder. WKWebView
+            // refuses to load a main resource that sits outside the
+            // `allowingReadAccessTo` subtree, so keeping it in baseDir lets us
+            // grant access to baseDir ALONE rather than the whole filesystem.
+            // That scopes the web view's file reach to the one folder the user
+            // opened (defense in depth: a malicious markdown can't read arbitrary
+            // local files) while relative images still resolve. Falls back to an
+            // in-memory load (no relative images) when the folder isn't writable.
+            let renderURL = baseDir.appendingPathComponent(".mdBuddy-preview.html")
+            removeRenderFile()  // clear any prior file, possibly in another folder
             do {
-                try html.write(to: tempHTMLURL, atomically: true, encoding: .utf8)
+                try html.write(to: renderURL, atomically: true, encoding: .utf8)
+                lastRenderURL = renderURL
+                webView.loadFileURL(renderURL, allowingReadAccessTo: baseDir)
             } catch {
-                webView.loadHTMLString(html, baseURL: baseDir)
-                return
+                webView.loadHTMLString(html, baseURL: nil)
             }
-            // The main resource (render.html) lives in the system temp dir, which
-            // is OUTSIDE the markdown's folder. WKWebView refuses to load a main
-            // resource that sits outside `allowingReadAccessTo` ("Ignoring request
-            // to load this main resource because it is outside the sandbox"), so
-            // granting access to baseDir alone leaves the window blank. Grant the
-            // filesystem root so both the temp HTML and relative images (resolved
-            // from baseDir via <base href>) load. The app is not sandboxed, so this
-            // adds no privilege it doesn't already have.
-            webView.loadFileURL(tempHTMLURL, allowingReadAccessTo: URL(fileURLWithPath: "/"))
         }
+
+        /// Delete the on-disk render file we last wrote (best effort).
+        func removeRenderFile() {
+            if let prior = lastRenderURL {
+                try? FileManager.default.removeItem(at: prior)
+                lastRenderURL = nil
+            }
+        }
+
+        deinit { removeRenderFile() }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             if let y = pendingScrollY {

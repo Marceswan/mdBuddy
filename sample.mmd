@@ -1,0 +1,6 @@
+graph TD
+    A[Open .mmd file] --> B{Extension?}
+    B -->|mmd / mermaid| C[Wrap in mermaid fence]
+    B -->|md / markdown| D[Render as Markdown]
+    C --> E[markdown-it + Mermaid -> SVG]
+    D --> E
